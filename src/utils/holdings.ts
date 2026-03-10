@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from "fs";
 import { resolve } from "path";
 import { logger } from "./logger";
 
@@ -12,6 +12,19 @@ export interface TokenHoldings {
 }
 
 const HOLDINGS_FILE = resolve(process.cwd(), "src/data/token-holding.json");
+const LOG_DIR = resolve(process.cwd(), "log");
+const HOLDINGS_LOG_FILE = resolve(LOG_DIR, "holdings-redeem.log");
+
+function ensureLogDir(): void {
+    if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function logToHoldingsFile(line: string): void {
+    try {
+        ensureLogDir();
+        appendFileSync(HOLDINGS_LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
+    } catch (_) {}
+}
 
 /**
  * Load holdings from file
@@ -58,6 +71,7 @@ export function addHoldings(marketId: string, tokenId: string, amount: number): 
     holdings[marketId][tokenId] += amount;
     
     saveHoldings(holdings);
+    logToHoldingsFile(`HOLDINGS_ADD conditionId=${marketId} tokenId=${tokenId} amount=${amount}`);
     logger.info(`Added ${amount} tokens to holdings: ${marketId} -> ${tokenId}`);
 }
 
@@ -118,6 +132,8 @@ export function getAllHoldings(): TokenHoldings {
 export function clearMarketHoldings(marketId: string): void {
     const holdings = loadHoldings();
     if (holdings[marketId]) {
+        const tokenIds = Object.keys(holdings[marketId]);
+        logToHoldingsFile(`HOLDINGS_CLEAR conditionId=${marketId} tokenIds=${tokenIds.join(",")}`);
         delete holdings[marketId];
         saveHoldings(holdings);
         logger.info(`Cleared holdings for market: ${marketId}`);

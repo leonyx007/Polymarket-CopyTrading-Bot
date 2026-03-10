@@ -1,6 +1,22 @@
 import { ClobClient, AssetType, type OpenOrder } from "@polymarket/clob-client";
 import { logger } from "./logger";
 
+const CLOB_DECIMALS = 6;
+
+/**
+ * CLOB API commonly returns amounts in raw units (micro, 6 decimals).
+ * If the string already contains a decimal point, treat it as human-readable.
+ */
+function parseClobAmount(value: string | undefined, decimals: number = CLOB_DECIMALS): number {
+    if (!value) return 0;
+    const trimmed = value.trim();
+    if (!trimmed) return 0;
+    const n = parseFloat(trimmed);
+    if (Number.isNaN(n)) return 0;
+    if (trimmed.includes(".")) return n;
+    return n / Math.pow(10, decimals);
+}
+
 /**
  * Calculate available balance for placing orders
  * Formula: availableBalance = totalBalance - sum of (orderSize - orderFillAmount) for open orders
@@ -17,7 +33,7 @@ export async function getAvailableBalance(
             ...(tokenId && { token_id: tokenId }),
         });
 
-        const totalBalance = parseFloat(balanceResponse.balance || "0");
+        const totalBalance = parseClobAmount(balanceResponse.balance);
 
         // Get open orders for this asset
         const openOrders = await client.getOpenOrders(
@@ -38,8 +54,8 @@ export async function getAvailableBalance(
                 (assetType === AssetType.COLLATERAL && isBuyOrder) ||
                 (assetType === AssetType.CONDITIONAL && isSellOrder)
             ) {
-                const orderSize = parseFloat(order.original_size || "0");
-                const sizeMatched = parseFloat(order.size_matched || "0");
+                const orderSize = parseClobAmount(order.original_size);
+                const sizeMatched = parseClobAmount(order.size_matched);
                 const reserved = orderSize - sizeMatched;
                 reservedAmount += reserved;
             }
@@ -70,8 +86,8 @@ export async function displayWalletBalance(client: ClobClient): Promise<void> {
             asset_type: AssetType.COLLATERAL,
         });
 
-        const balance = parseFloat(balanceResponse.balance || "0");
-        const allowance = parseFloat(balanceResponse.allowance || "0");
+        const balance = parseClobAmount(balanceResponse.balance);
+        const allowance = parseClobAmount(balanceResponse.allowance);
 
         logger.info("═══════════════════════════════════════");
         logger.info("💰 WALLET BALANCE & ALLOWANCE");
@@ -98,8 +114,8 @@ export async function validateBuyOrderBalance(
             asset_type: AssetType.COLLATERAL,
         });
 
-        const balance = parseFloat(balanceResponse.balance || "0");
-        const allowance = parseFloat(balanceResponse.allowance || "0");
+        const balance = parseClobAmount(balanceResponse.balance);
+        const allowance = parseClobAmount(balanceResponse.allowance);
         const available = await getAvailableBalance(client, AssetType.COLLATERAL);
         const valid = available >= requiredAmount;
 
@@ -141,4 +157,5 @@ export async function validateSellOrderBalance(
 
     return { valid, available, required: requiredAmount };
 }
+
 

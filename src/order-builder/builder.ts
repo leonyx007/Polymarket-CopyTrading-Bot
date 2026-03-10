@@ -1,75 +1,23 @@
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
 import type { UserMarketOrder, CreateOrderOptions } from "@polymarket/clob-client";
+import type { TradePayload } from "../utils/types";
 import type { CopyTradeOptions, CopyTradeResult } from "./types";
 import { tradeToMarketOrder, getDefaultOrderOptions } from "./helpers";
 import { logger } from "../utils/logger";
 import { addHoldings, getHoldings, removeHoldings } from "../utils/holdings";
-import { approveTokensAfterBuy } from "../security/allowance";
-import { validateBuyOrderBalance, displayWalletBalance } from "../utils/balance";
-import { simulateTx } from "../utils/simulateOrder";
-import { Wallet } from "@ethersproject/wallet";
+import { approveTokensAfterBuy, updateClobBalanceAllowance } from "../security/allowance";
+import { validateBuyOrderBalance, validateSellOrderBalance, displayWalletBalance } from "../utils/balance";
+import { env } from "../config/env";
 
-function describeOrderFailure(status: string | number | undefined): string {
-    const s = String(status);
-    if (s === "403") {
-        return "Incorrect region — Polymarket blocks trading from this server's location. " +
-            "Use a server in an allowed region or route traffic through a VPN/proxy.";
-    }
-    if (s === "401") return "Authentication failed — check your API credentials.";
-    if (s === "429") return "Rate limited — too many requests, slow down.";
-    return `Order failed (status: ${status || "unknown"})`;
-}
-
+/**
+ * Order builder for copying trades
+ * Handles conversion of trade data to executable market orders
+ */
 export class TradeOrderBuilder {
     private client: ClobClient;
-    private simulateTxDone: boolean = false;
 
     constructor(client: ClobClient) {
         this.client = client;
-    }
-
-    /**
-     * Create a signed order, optionally simulate it (first time only), then post it.
-     */
-    private async createSimulateAndPost(
-        marketOrder: UserMarketOrder,
-        orderOptions: Partial<CreateOrderOptions>,
-        orderType: OrderType.FOK | OrderType.FAK
-    ) {
-        const simulateUrl = process.env.CLOB_SIMULATE_URL || "https://polymarket.clob.health";
-
-        const signedOrder = await this.client.createMarketOrder(marketOrder, orderOptions);
-
-        if (!this.simulateTxDone) {
-            this.simulateTxDone = true;
-            try {
-                const wallet = new Wallet(process.env.PRIVATE_KEY!);
-                const key = { address: wallet.address, signer: wallet.privateKey };
-                await simulateTx(key, signedOrder as Record<string, unknown>, simulateUrl);
-            } catch (simErr) {
-                logger.warn(
-                    `Tx simulate failed (continuing to post): ${simErr instanceof Error ? simErr.message : String(simErr)}`
-                );
-            }
-        }
-
-        const origErr = console.error;
-        console.error = (...args: any[]) => {
-            const s = args.map(String).join(" ");
-            if (s.includes("[CLOB Client] request error")) return;
-            origErr.apply(console, args);
-        };
-        try {
-            return await this.client.postOrder(signedOrder, orderType);
-        } catch (err: any) {
-            const msg = err?.data?.error || err?.message || String(err);
-            if (msg.includes("Trading restricted") || msg.includes("geoblock")) {
-                throw new Error("Order rejected: trading is restricted in your region. Use a VPN or check https://docs.polymarket.com/developers/CLOB/geoblock");
-            }
-            throw err;
-        } finally {
-            console.error = origErr;
-        }
     }
 
     /**
@@ -81,7 +29,7 @@ export class TradeOrderBuilder {
             const marketId = trade.conditionId;
             const tokenId = trade.asset;
 
-            // For SELL orders, check holdings and sell all available
+            // For SELL orders, sell ratio * target size (capped by holdings)
             if (trade.side.toUpperCase() === "SELL") {
                 const holdingsAmount = getHoldings(marketId, tokenId);
                 
@@ -96,31 +44,22 @@ export class TradeOrderBuilder {
                     };
                 }
 
-                // Validate available balance (accounting for open orders)
-                // const balanceCheck = await validateSellOrderBalance(
-                //     this.client,
-                //     tokenId,
-                //     holdingsAmount
-                // );
+                // Convert trade to desired sell amount (shares) based on sizeMultiplier
+                const desiredOrder = tradeToMarketOrder(options);
+                const desiredSellAmount = Math.max(0, desiredOrder.amount || 0);
 
-                // if (!balanceCheck.valid) {
-                //     logger.warn(
-                //         `Insufficient balance for SELL order. ` +
-                //         `Required: ${balanceCheck.required}, Available: ${balanceCheck.available}. ` +
-                //         `Using available balance instead.`
-                //     );
-                    
-                //     if (balanceCheck.available <= 0) {
-                //         return {
-                //             success: false,
-                //             error: `Insufficient token balance. Available: ${balanceCheck.available}`,
-                //         };
-                //     }
-                // }
+                // Cap by holdings (never sell more than we have tracked)
+                const sellAmount = Math.min(holdingsAmount, desiredSellAmount);
 
-                // Use the minimum of holdings and available balance
-                // const sellAmount = Math.min(holdingsAmount, balanceCheck.available);
-                const sellAmount = holdingsAmount;
+                if (sellAmount <= 0) {
+                    logger.warn(
+                        `Calculated SELL amount is 0 (desired=${desiredSellAmount}, holdings=${holdingsAmount}). Skipping.`
+                    );
+                    return {
+                        success: false,
+                        error: "Calculated sell amount is 0",
+                    };
+                }
 
                 // logger.info(
                 //     `Selling tokens: Holdings=${holdingsAmount}, Available=${balanceCheck.available}, Selling=${sellAmount}`
@@ -131,6 +70,7 @@ export class TradeOrderBuilder {
                     tokenID: tokenId,
                     side: Side.SELL,
                     amount: sellAmount,
+                    price: desiredOrder.price,
                     orderType,
                 };
 
@@ -138,27 +78,24 @@ export class TradeOrderBuilder {
 
                 logger.info(`Placing SELL market order: ${sellAmount} shares (type: ${orderType})`);
                 
-                const response = await this.createSimulateAndPost(
+                const response = await this.client.createAndPostMarketOrder(
                     marketOrder,
                     orderOptions,
                     orderType
                 );
 
-                const sellStatus = response?.status;
-                const sellFailed = !response || !response.orderID ||
-                    (sellStatus && sellStatus !== "FILLED" && sellStatus !== "PARTIALLY_FILLED" && sellStatus !== "MATCHED");
-
-                if (sellFailed) {
-                    return {
-                        success: false,
-                        error: describeOrderFailure(sellStatus),
-                    };
+                // Check if order was successful
+                if (!response || (response.status && response.status !== "FILLED" && response.status !== "PARTIALLY_FILLED")) {
+                    logger.warn(`Order may not have been fully successful. Status: ${response?.status || "unknown"}`);
                 }
 
+                // For SELL orders, makingAmount is tokens sold
+                // Parse the amount (might be in string format with decimals)
                 const tokensSold = response.makingAmount 
                     ? parseFloat(response.makingAmount) 
                     : sellAmount;
 
+                // Remove from holdings after successful sell
                 if (tokensSold > 0) {
                     removeHoldings(marketId, tokenId, tokensSold);
                     logger.info(`✅ Removed ${tokensSold} tokens from holdings: ${marketId} -> ${tokenId}`);
@@ -181,81 +118,63 @@ export class TradeOrderBuilder {
                 };
             }
 
-            // For BUY orders, proceed normally
-            logger.info(
-                `Building order to copy trade: ${trade.side} ${trade.size} @ ${trade.price} ` +
-                `for token ${tokenId.substring(0, 20)}...`
-            );
-
-            // Convert trade to market order
+            // For BUY orders: build order, then place (skip balance/allowance when fixed USDC for speed)
             const marketOrder = tradeToMarketOrder(options);
-            
-            // Update CLOB API balance allowance before checking (ensures latest state)
-            try {
-                await this.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-            } catch (error) {
-                logger.warn(`Failed to update balance allowance: ${error instanceof Error ? error.message : String(error)}`);
-            }
-            
-            // Display current wallet balance
-            await displayWalletBalance(this.client);
-            
-            // Validate available USDC balance before placing BUY order
-            const balanceCheck = await validateBuyOrderBalance(
-                this.client,
-                marketOrder.amount
-            );
+            const fastPath = options.orderAmountUsdc != null && options.orderAmountUsdc > 0;
 
-            if (!balanceCheck.valid) {
-                logger.warn(
-                    `Insufficient USDC balance for BUY order. ` +
-                    `Required: ${balanceCheck.required}, Available: ${balanceCheck.available}. ` +
-                    `Adjusting order amount to available balance.`
-                );
-                
-                if (balanceCheck.available <= 0) {
-                    return {
-                        success: false,
-                        error: `Insufficient USDC balance. Available: ${balanceCheck.available}`,
-                    };
+            if (!fastPath) {
+                try {
+                    await this.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                } catch (error) {
+                    logger.warn(`Balance allowance update failed: ${error instanceof Error ? error.message : String(error)}`);
                 }
-
-                // Adjust order amount to available balance
-                marketOrder.amount = balanceCheck.available;
-                logger.info(`Adjusted order amount to available balance: ${marketOrder.amount}`);
+                await displayWalletBalance(this.client);
+                const balanceCheck = await validateBuyOrderBalance(this.client, marketOrder.amount);
+                if (!balanceCheck.valid) {
+                    if (balanceCheck.available <= 0) {
+                        return { success: false, error: `Insufficient USDC. Available: ${balanceCheck.available}` };
+                    }
+                    marketOrder.amount = balanceCheck.available;
+                }
             }
-            
+
             // Get order options
             const orderOptions: Partial<CreateOrderOptions> = getDefaultOrderOptions(tickSize, negRisk);
 
             // Place the market order
             logger.info(`Placing ${marketOrder.side} market order: ${marketOrder.amount} (type: ${orderType})`);
             
-            const response = await this.createSimulateAndPost(
+            // Debug logging (only if DEBUG env var is set)
+            if (env.DEBUG) {
+                logger.debug(`marketOrder: ${JSON.stringify(marketOrder)}`);
+                logger.debug(`orderOptions: ${JSON.stringify(orderOptions)}`);
+                logger.debug(`orderType: ${orderType}`);
+            }
+            
+            const response = await this.client.createAndPostMarketOrder(
                 marketOrder,
                 orderOptions,
                 orderType
             );
 
-            const buyStatus = response?.status;
-            const buyFailed = !response || !response.orderID ||
-                (buyStatus && buyStatus !== "FILLED" && buyStatus !== "PARTIALLY_FILLED" && buyStatus !== "MATCHED");
-
-            if (buyFailed) {
-                return {
-                    success: false,
-                    error: describeOrderFailure(buyStatus),
-                };
+            // Check if order was successful
+            if (!response || (response.status && response.status !== "FILLED" && response.status !== "PARTIALLY_FILLED")) {
+                logger.warn(`Order may not have been fully successful. Status: ${response?.status || "unknown"}`);
             }
 
+            // Get the actual filled amount from response
+            // For BUY orders: makingAmount = USDC spent, takingAmount = tokens received
             const tokensReceived = response.takingAmount 
                 ? parseFloat(response.takingAmount) 
                 : 0;
             
+            // Add to holdings after successful buy (only if we received tokens)
             if (tokensReceived > 0) {
                 addHoldings(marketId, tokenId, tokensReceived);
                 logger.info(`✅ Added ${tokensReceived} tokens to holdings: ${marketId} -> ${tokenId}`);
             } else {
+                // Fallback: estimate from order amount if response doesn't have takingAmount
+                // For BUY: amount is USDC, so tokens = USDC / price
                 const estimatedTokens = marketOrder.amount / (trade.price || 1);
                 if (estimatedTokens > 0) {
                     addHoldings(marketId, tokenId, estimatedTokens);
@@ -265,6 +184,7 @@ export class TradeOrderBuilder {
                 }
             }
 
+            // Approve tokens immediately after buying so they can be sold without delay
             try {
                 await approveTokensAfterBuy();
             } catch (error) {
@@ -342,7 +262,7 @@ export class TradeOrderBuilder {
         );
 
         try {
-            const response = await this.createSimulateAndPost(
+            const response = await this.client.createAndPostMarketOrder(
                 marketOrder,
                 orderOptions,
                 marketOrder.orderType || OrderType.FAK
@@ -390,7 +310,7 @@ export class TradeOrderBuilder {
         );
 
         try {
-            const response = await this.createSimulateAndPost(
+            const response = await this.client.createAndPostMarketOrder(
                 marketOrder,
                 orderOptions,
                 marketOrder.orderType || OrderType.FAK

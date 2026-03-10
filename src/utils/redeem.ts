@@ -3,13 +3,29 @@ import { hexZeroPad } from "@ethersproject/bytes";
 import { Wallet } from "@ethersproject/wallet";
 import { JsonRpcProvider } from "@ethersproject/providers";
 import { Contract } from "@ethersproject/contracts";
-import { resolve } from "path";
-import { config as dotenvConfig } from "dotenv";
 import { Chain, getContractConfig } from "@polymarket/clob-client";
 import { logger } from "./logger";
 import { getClobClient } from "../providers/clobclient";
+import Safe from "@safe-global/protocol-kit";
+import { MetaTransactionData, OperationType } from "@safe-global/types-kit";
+import { env, getRpcUrl } from "../config/env";
+import { resolve } from "path";
+import { existsSync, mkdirSync, appendFileSync } from "fs";
 
-dotenvConfig({ path: resolve(process.cwd(), ".env") });
+const PROXY_WALLET_ADDRESS = env.PROXY_WALLET_ADDRESS;
+const LOG_DIR = resolve(process.cwd(), "log");
+const REDEEM_LOG_FILE = resolve(LOG_DIR, "holdings-redeem.log");
+
+function redeemLog(line: string): void {
+    try {
+        if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+        appendFileSync(REDEEM_LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
+    } catch (_) {}
+}
+
+if (env.DEBUG) {
+    logger.info(`[DEBUG] Using proxy wallet address: ${PROXY_WALLET_ADDRESS}`);
+}
 
 // CTF Contract ABI - functions needed for redemption and checking resolution
 const CTF_ABI = [
@@ -175,51 +191,6 @@ const CTF_ABI = [
     },
 ];
 
-function getRpcCandidates(chainId: number): string[] {
-    const out: string[] = [];
-    const rpcUrl = process.env.RPC_URL;
-    const rpcToken = process.env.RPC_TOKEN;
-    if (rpcUrl) out.push(rpcUrl);
-
-    if (chainId === 137) {
-        if (rpcToken) out.push(`https://polygon-mainnet.g.alchemy.com/v2/${rpcToken}`);
-        out.push(
-            "https://polygon-rpc.com",
-            "https://rpc.ankr.com/polygon",
-            "https://polygon.llamarpc.com",
-            "https://rpc-mainnet.matic.quiknode.pro",
-        );
-        return [...new Set(out)];
-    }
-    if (chainId === 80002) {
-        if (rpcToken) out.push(`https://polygon-amoy.g.alchemy.com/v2/${rpcToken}`);
-        out.push("https://rpc-amoy.polygon.technology");
-        return [...new Set(out)];
-    }
-    throw new Error(`Unsupported chain ID: ${chainId}. Supported: 137 (Polygon), 80002 (Amoy)`);
-}
-
-async function getWorkingProvider(chainId: number): Promise<{ provider: JsonRpcProvider; rpcUrl: string }> {
-    const candidates = getRpcCandidates(chainId);
-    const errors: string[] = [];
-    for (const rpcUrl of candidates) {
-        const provider = new JsonRpcProvider(rpcUrl);
-        try {
-            await Promise.race([
-                provider.getNetwork(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 7000)),
-            ]);
-            return { provider, rpcUrl };
-        } catch (e) {
-            errors.push(`${rpcUrl} -> ${e instanceof Error ? e.message : String(e)}`);
-        }
-    }
-    throw new Error(
-        `Could not connect to any RPC endpoint for chainId=${chainId}. ` +
-        `Set RPC_URL in .env. Attempts:\n- ${errors.join("\n- ")}`
-    );
-}
-
 /**
  * Options for redeeming positions
  */
@@ -253,15 +224,17 @@ export interface RedeemOptions {
  * ```
  */
 export async function redeemPositions(options: RedeemOptions): Promise<any> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainId = options.chainId || parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainId = options.chainId || (env.CHAIN_ID as Chain);
     const contractConfig = getContractConfig(chainId);
     
-    const { provider } = await getWorkingProvider(chainId);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainId);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
     
     const address = await wallet.getAddress();
@@ -291,6 +264,7 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
     );
 
     logger.info("\n=== REDEEMING POSITIONS ===");
+    logger.info(`Contract Config: ${contractConfig.conditionalTokens}`);
     logger.info(`Condition ID: ${conditionIdBytes32}`);
     logger.info(`Index Sets: ${indexSets.join(", ")}`);
     logger.info(`Collateral Token: ${contractConfig.collateral}`);
@@ -344,6 +318,137 @@ export async function redeemPositions(options: RedeemOptions): Promise<any> {
         }
         throw error;
     }
+}
+
+/**
+ * Redeem positions by executing through the Gnosis Safe (proxy wallet).
+ * Use this when tokens are held by the proxy (e.g. Gnosis signature type) so that
+ * the Safe is msg.sender and the CTF redeems the Safe's tokens.
+ */
+async function redeemPositionsViaSafe(
+    conditionId: string,
+    indexSets: number[],
+    chainIdValue: Chain
+): Promise<any> {
+    const privateKey = env.PRIVATE_KEY;
+    if (!privateKey) {
+        throw new Error("PRIVATE_KEY not found in environment");
+    }
+
+    const contractConfig = getContractConfig(chainIdValue);
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const parentCollectionId = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+    let conditionIdBytes32: string;
+    if (conditionId.startsWith("0x")) {
+        conditionIdBytes32 = hexZeroPad(conditionId, 32);
+    } else {
+        conditionIdBytes32 = hexZeroPad(BigNumber.from(conditionId).toHexString(), 32);
+    }
+
+    const ctfContract = new Contract(contractConfig.conditionalTokens, CTF_ABI);
+    const data = ctfContract.interface.encodeFunctionData("redeemPositions", [
+        contractConfig.collateral,
+        parentCollectionId,
+        conditionIdBytes32,
+        indexSets,
+    ]);
+
+    const metaTx: MetaTransactionData = {
+        to: contractConfig.conditionalTokens,
+        value: "0",
+        data,
+        operation: OperationType.Call,
+    };
+
+    logger.info("\n=== REDEEMING VIA SAFE (PROXY) ===");
+    logger.info(`Safe (proxy) address: ${PROXY_WALLET_ADDRESS}`);
+    logger.info(`CTF contract: ${contractConfig.conditionalTokens}`);
+    logger.info(`Condition ID: ${conditionIdBytes32}`);
+    logger.info(`Index Sets: ${indexSets.join(", ")}`);
+
+    let safeSdk: InstanceType<typeof Safe>;
+    try {
+        logger.info("Initializing Safe SDK...");
+        safeSdk = await Safe.init({
+            provider: rpcUrl,
+            signer: privateKey,
+            safeAddress: PROXY_WALLET_ADDRESS,
+        });
+        logger.info("Safe SDK initialized");
+    } catch (initErr: unknown) {
+        const msg = initErr instanceof Error ? initErr.message : String(initErr);
+        const err = initErr as { reason?: string; code?: string; data?: unknown };
+        logger.error("Safe.init failed.");
+        logger.error("PROXY_WALLET_ADDRESS must be a Gnosis Safe (MetaMask users). MagicLink users use a different proxy and cannot use this path.");
+        logger.error("Error: " + msg);
+        if (err.reason) logger.error("Reason: " + err.reason);
+        if (err.code) logger.error("Code: " + err.code);
+        if (err.data) logger.error("Data: " + JSON.stringify(err.data));
+        if (initErr instanceof Error && initErr.stack) logger.error(initErr.stack);
+        throw initErr;
+    }
+
+    let safeTransaction: Awaited<ReturnType<InstanceType<typeof Safe>["createTransaction"]>>;
+    try {
+        logger.info("Creating Safe transaction...");
+        safeTransaction = await safeSdk.createTransaction({ transactions: [metaTx] });
+        logger.info("Safe transaction created");
+    } catch (createErr: unknown) {
+        const msg = createErr instanceof Error ? createErr.message : String(createErr);
+        const err = createErr as { reason?: string; code?: string; data?: unknown };
+        logger.error("createTransaction failed: " + msg);
+        if (err.reason) logger.error("Reason: " + err.reason);
+        if (err.code) logger.error("Code: " + err.code);
+        if (createErr instanceof Error && createErr.stack) logger.error(createErr.stack);
+        throw createErr;
+    }
+
+    let signedTx: Awaited<ReturnType<InstanceType<typeof Safe>["signTransaction"]>>;
+    try {
+        logger.info("Signing Safe transaction...");
+        signedTx = await safeSdk.signTransaction(safeTransaction);
+        logger.info("Safe transaction signed");
+    } catch (signErr: unknown) {
+        const msg = signErr instanceof Error ? signErr.message : String(signErr);
+        logger.error("signTransaction failed: " + msg);
+        if (signErr instanceof Error && signErr.stack) logger.error(signErr.stack);
+        throw signErr;
+    }
+
+    let result: Awaited<ReturnType<InstanceType<typeof Safe>["executeTransaction"]>>;
+    try {
+        logger.info("Executing Safe transaction (sending to chain)...");
+        result = await safeSdk.executeTransaction(signedTx);
+        logger.info("Transaction sent: " + result.hash);
+    } catch (execErr: unknown) {
+        const msg = execErr instanceof Error ? execErr.message : String(execErr);
+        const err = execErr as { reason?: string; code?: string; data?: unknown };
+        logger.error("executeTransaction failed: " + msg);
+        if (err.reason) logger.error("Reason: " + err.reason);
+        if (err.code) logger.error("Code: " + err.code);
+        if (msg.includes("signatures missing")) {
+            logger.warn("Your Safe may require more than one signature. Ensure the signer (PRIVATE_KEY) is an owner and that the Safe threshold is met.");
+        }
+        if (execErr instanceof Error && execErr.stack) logger.error(execErr.stack);
+        throw execErr;
+    }
+
+    // Wait for receipt so we know if the tx succeeded or reverted
+    const provider = new JsonRpcProvider(rpcUrl);
+    try {
+        const receipt = await provider.waitForTransaction(result.hash, 1, 60_000);
+        if (receipt && receipt.status === 0) {
+            logger.error("Transaction reverted on-chain. Check contract state (e.g. tokens held by proxy, correct conditionId/indexSets).");
+        } else if (receipt) {
+            logger.success("Transaction confirmed in block " + receipt.blockNumber);
+        }
+    } catch (waitErr: unknown) {
+        logger.warn("Could not wait for receipt: " + (waitErr instanceof Error ? waitErr.message : String(waitErr)));
+    }
+
+    logger.success("\n=== REDEEM COMPLETE (VIA SAFE) ===");
+    return result;
 }
 
 /**
@@ -446,18 +551,21 @@ export async function redeemMarket(
     chainId?: Chain,
     maxRetries: number = 3
 ): Promise<any> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainIdValue = chainId || parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainIdValue = chainId || (env.CHAIN_ID as Chain);
     const contractConfig = getContractConfig(chainIdValue);
     
-    const { provider } = await getWorkingProvider(chainIdValue);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
     const walletAddress = await wallet.getAddress();
     
+    redeemLog(`REDEEM_ATTEMPT conditionId=${conditionId} proxy=${PROXY_WALLET_ADDRESS}`);
     logger.info("\n=== CHECKING MARKET RESOLUTION ===");
     
     // Check if condition is resolved and get winning outcomes
@@ -474,10 +582,14 @@ export async function redeemMarket(
     logger.info(`Winning indexSets: ${resolution.winningIndexSets.join(", ")}`);
     
     // Get user's token balances for this condition
-    logger.info("Checking your token balances...");
-    const userBalances = await getUserTokenBalances(conditionId, walletAddress, chainIdValue);
+    // Use proxy wallet address (where tokens are actually stored by ClobClient)
+    logger.info(`Checking token balances at proxy wallet: ${PROXY_WALLET_ADDRESS}`);
+    const userBalances = await getUserTokenBalances(conditionId, PROXY_WALLET_ADDRESS, chainIdValue);
+    const balancesLog = Array.from(userBalances.entries()).map(([k, v]) => `${k}:${v.toString()}`).join(" ");
+    redeemLog(`REDEEM_BALANCES conditionId=${conditionId} proxyBalancesByIndexSet=${balancesLog || "none"}`);
     
     if (userBalances.size === 0) {
+        redeemLog(`REDEEM_SKIP conditionId=${conditionId} reason=no_tokens_at_proxy`);
         throw new Error("You don't have any tokens for this condition to redeem");
     }
     
@@ -506,9 +618,17 @@ export async function redeemMarket(
     // Redeem only the winning outcomes user holds
     logger.info(`\nRedeeming winning positions: ${redeemableIndexSets.join(", ")}`);
     
+    const useProxyRedeem = walletAddress.toLowerCase() !== PROXY_WALLET_ADDRESS.toLowerCase();
+    if (useProxyRedeem) {
+        logger.info("Using proxy (Gnosis Safe) redemption — tokens are held by proxy wallet");
+    }
+
     // Use retry logic for redemption (handles RPC/network errors)
     return retryWithBackoff(
         async () => {
+            if (useProxyRedeem) {
+                return await redeemPositionsViaSafe(conditionId, redeemableIndexSets, chainIdValue);
+            }
             return await redeemPositions({
                 conditionId,
                 indexSets: redeemableIndexSets,
@@ -538,15 +658,17 @@ export async function checkConditionResolution(
     outcomeSlotCount: number;
     reason?: string;
 }> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainIdValue = chainId || parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainIdValue = chainId || (env.CHAIN_ID as Chain);
     const contractConfig = getContractConfig(chainIdValue);
     
-    const { provider } = await getWorkingProvider(chainIdValue);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
     
     // Convert conditionId to bytes32 format
@@ -558,6 +680,7 @@ export async function checkConditionResolution(
         conditionIdBytes32 = hexZeroPad(bn.toHexString(), 32);
     }
 
+    // Create CTF contract instance
     const ctfContract = new Contract(
         contractConfig.conditionalTokens,
         CTF_ABI,
@@ -565,6 +688,7 @@ export async function checkConditionResolution(
     );
 
     try {
+        // Get outcome slot count (usually 2 for binary markets)
         const outcomeSlotCount = (await ctfContract.getOutcomeSlotCount(conditionIdBytes32)).toNumber();
         
         // Check payout denominator - if > 0, condition is resolved
@@ -629,17 +753,20 @@ export async function getUserTokenBalances(
     walletAddress: string,
     chainId?: Chain
 ): Promise<Map<number, BigNumber>> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainIdValue = chainId || parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainIdValue = chainId || (env.CHAIN_ID as Chain);
     const contractConfig = getContractConfig(chainIdValue);
     
-    const { provider } = await getWorkingProvider(chainIdValue);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
     
+    // Convert conditionId to bytes32 format
     let conditionIdBytes32: string;
     if (conditionId.startsWith("0x")) {
         conditionIdBytes32 = hexZeroPad(conditionId, 32);
@@ -661,8 +788,9 @@ export async function getUserTokenBalances(
     try {
         // Get outcome slot count
         const outcomeSlotCount = (await ctfContract.getOutcomeSlotCount(conditionIdBytes32)).toNumber();
-        
+
         // Check balance for each indexSet (1-indexed)
+        const derivedTokenIds: string[] = [];
         for (let i = 1; i <= outcomeSlotCount; i++) {
             try {
                 // Get collection ID for this indexSet
@@ -671,13 +799,13 @@ export async function getUserTokenBalances(
                     conditionIdBytes32,
                     i
                 );
-                
+
                 // Get position ID (token ID)
                 const positionId = await ctfContract.getPositionId(
                     contractConfig.collateral,
                     collectionId
                 );
-                
+                derivedTokenIds.push(`${i}:${positionId.toString()}`);
                 // Get balance
                 const balance = await ctfContract.balanceOf(walletAddress, positionId);
                 if (!balance.isZero()) {
@@ -688,8 +816,10 @@ export async function getUserTokenBalances(
                 continue;
             }
         }
+        redeemLog(`REDEEM_DERIVED_TOKEN_IDS conditionId=${conditionId} indexSet_to_positionId=${derivedTokenIds.join(" ")}`);
     } catch (error) {
         logger.error("Failed to get user token balances", error);
+        redeemLog(`REDEEM_GET_BALANCES_ERROR conditionId=${conditionId} error=${error instanceof Error ? error.message : String(error)}`);
     }
     
     return balances;
@@ -961,19 +1091,22 @@ export async function getMarketsWithUserPositions(
         onlyRedeemable?: boolean; // Only return positions that are redeemable (default: false)
     }
 ): Promise<Array<{ conditionId: string; position: CurrentPosition; balances: Map<number, BigNumber> }>> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainIdValue = options?.chainId || parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainIdValue = options?.chainId || (env.CHAIN_ID as Chain);
     
-    const { provider } = await getWorkingProvider(chainIdValue);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
-    const walletAddress = options?.walletAddress || await wallet.getAddress();
+    // Use proxy wallet address (where tokens are stored by ClobClient)
+    const walletAddress = options?.walletAddress || PROXY_WALLET_ADDRESS;
     
     logger.info(`\n=== FINDING YOUR CURRENT/ACTIVE POSITIONS ===`);
-    logger.info(`Wallet: ${walletAddress}`);
+    logger.info(`Using proxy wallet: ${walletAddress}`);
     logger.info(`Using /positions endpoint (returns tokens you currently hold)`);
     
     const marketsWithPositions: Array<{ conditionId: string; position: CurrentPosition; balances: Map<number, BigNumber> }> = [];
@@ -1051,8 +1184,8 @@ export async function getMarketsWithUserPositions(
         // For each market, verify on-chain balances
         for (const [conditionId, positions] of positionsByMarket.entries()) {
             try {
-                // Verify user currently has tokens in this market (on-chain check)
-                const userBalances = await getUserTokenBalances(conditionId, walletAddress, chainIdValue);
+                // Verify user currently has tokens in this market (on-chain check using proxy wallet)
+                const userBalances = await getUserTokenBalances(conditionId, PROXY_WALLET_ADDRESS, chainIdValue);
                 
                 if (userBalances.size > 0) {
                     // User has active positions in this market!
@@ -1141,15 +1274,17 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
         error?: string;
     }>;
 }> {
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found in environment");
     }
 
-    const chainIdValue = parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
+    const chainIdValue = env.CHAIN_ID as Chain;
     const contractConfig = getContractConfig(chainIdValue);
     
-    const { provider } = await getWorkingProvider(chainIdValue);
+    // Get RPC URL and create provider
+    const rpcUrl = getRpcUrl(chainIdValue);
+    const provider = new JsonRpcProvider(rpcUrl);
     const wallet = new Wallet(privateKey, provider);
     const walletAddress = await wallet.getAddress();
     
@@ -1158,7 +1293,8 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
     const maxMarkets = options?.maxMarkets || 1000;
     
     logger.info(`\n=== FETCHING YOUR POSITIONS FROM POLYMARKET API ===`);
-    logger.info(`Wallet: ${walletAddress}`);
+    logger.info(`EOA Wallet: ${walletAddress}`);
+    logger.info(`Proxy Wallet: ${PROXY_WALLET_ADDRESS}`);
     logger.info(`Max markets to check: ${maxMarkets}`);
     logger.info(`\nStep 1: Finding markets where you have positions...`);
     
@@ -1180,10 +1316,11 @@ export async function redeemAllWinningMarketsFromAPI(options?: {
     let failedCount = 0;
     
     // Step 1: Find all markets where user has positions
+    // Use proxy wallet address (where ClobClient stores tokens)
     logger.info(`\nStep 1: Finding markets where you have positions...`);
     const marketsWithUserPositionsData = await getMarketsWithUserPositions({
         maxPositions: maxMarkets,
-        walletAddress,
+        walletAddress: PROXY_WALLET_ADDRESS,
         chainId: chainIdValue,
     });
     

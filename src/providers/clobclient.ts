@@ -1,11 +1,9 @@
 import { resolve } from "path";
 import { readFileSync, existsSync } from "fs";
-import { config as dotenvConfig } from "dotenv";
 import { Chain, ClobClient } from "@polymarket/clob-client";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
-
-dotenvConfig({ path: resolve(process.cwd(), ".env") });
+import { env } from "../config/env";
 
 // Cache for ClobClient instance to avoid repeated initialization
 let cachedClient: ClobClient | null = null;
@@ -25,8 +23,8 @@ export async function getClobClient(): Promise<ClobClient> {
 
     const creds: ApiKeyCreds = JSON.parse(readFileSync(credentialPath, "utf-8"));
     
-    const chainId = parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
-    const host = process.env.CLOB_API_URL || "https://clob.polymarket.com";
+    const chainId = env.CHAIN_ID as Chain;
+    const host = env.CLOB_API_URL;
 
     // Return cached client if config hasn't changed
     if (cachedClient && cachedConfig && 
@@ -36,7 +34,7 @@ export async function getClobClient(): Promise<ClobClient> {
     }
 
     // Create wallet from private key
-    const privateKey = process.env.PRIVATE_KEY;
+    const privateKey = env.PRIVATE_KEY;
     if (!privateKey) {
         throw new Error("PRIVATE_KEY not found");
     }
@@ -52,8 +50,10 @@ export async function getClobClient(): Promise<ClobClient> {
         passphrase: creds.passphrase,
     };
 
+    const proxyWalletAddress = env.PROXY_WALLET_ADDRESS;
+    
     // Create and cache client
-    cachedClient = new ClobClient(host, chainId, wallet, apiKeyCreds);
+    cachedClient = new ClobClient(host, chainId, wallet, apiKeyCreds, 2, proxyWalletAddress);
     cachedConfig = { chainId, host };
 
     return cachedClient;
@@ -65,32 +65,4 @@ export async function getClobClient(): Promise<ClobClient> {
 export function clearClobClientCache(): void {
     cachedClient = null;
     cachedConfig = null;
-}
-
-// Simulation client: uses CLOB health URL (read-only / simulation)
-const SIMULATION_CLOB_URL = process.env.CLOB_SIMULATION_URL || "https://polymarket.clob.health";
-let cachedSimulationClient: ClobClient | null = null;
-
-/**
- * Get a ClobClient pointed at the simulation/health endpoint.
- * Use this for order-book simulation (e.g. SimulateTx) so traffic goes to the health URL.
- */
-export async function getSimulationClobClient(): Promise<ClobClient> {
-    if (cachedSimulationClient) return cachedSimulationClient;
-
-    const chainId = parseInt(`${process.env.CHAIN_ID || Chain.POLYGON}`) as Chain;
-    const credentialPath = resolve(process.cwd(), "src/data/credential.json");
-    const privateKey = process.env.PRIVATE_KEY;
-
-    if (!existsSync(credentialPath) || !privateKey) {
-        throw new Error("Credential and PRIVATE_KEY required for simulation client.");
-    }
-
-    const creds: ApiKeyCreds = JSON.parse(readFileSync(credentialPath, "utf-8"));
-    const wallet = new Wallet(privateKey);
-    const secretBase64 = creds.secret.replace(/-/g, '+').replace(/_/g, '/');
-    const apiKeyCreds: ApiKeyCreds = { key: creds.key, secret: secretBase64, passphrase: creds.passphrase };
-    cachedSimulationClient = new ClobClient(SIMULATION_CLOB_URL, chainId, wallet, apiKeyCreds);
-
-    return cachedSimulationClient;
 }

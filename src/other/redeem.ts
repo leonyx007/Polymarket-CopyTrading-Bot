@@ -9,13 +9,10 @@
  * Or set CONDITION_ID and INDEX_SETS in .env file
  */
 
-import { redeemPositions, redeemMarket } from "./utils/redeem";
-import { getAllHoldings, getMarketHoldings } from "./utils/holdings";
-import { logger } from "./utils/logger";
-import { resolve } from "path";
-import { config as dotenvConfig } from "dotenv";
-
-dotenvConfig({ path: resolve(process.cwd(), ".env") });
+import { redeemPositions, redeemMarket } from "../utils/redeem";
+import { getAllHoldings, getMarketHoldings } from "../utils/holdings";
+import { logger } from "../utils/logger";
+import { env } from "../config/env";
 
 async function main() {
     const args = process.argv.slice(2);
@@ -30,8 +27,8 @@ async function main() {
             indexSets = args.slice(1).map(arg => parseInt(arg, 10));
         }
     } else {
-        conditionId = process.env.CONDITION_ID;
-        const indexSetsEnv = process.env.INDEX_SETS;
+        conditionId = env.CONDITION_ID;
+        const indexSetsEnv = env.INDEX_SETS;
         if (indexSetsEnv) {
             indexSets = indexSetsEnv.split(",").map(s => parseInt(s.trim(), 10));
         }
@@ -96,7 +93,7 @@ async function main() {
 
         // Automatically clear holdings after successful redemption
         try {
-            const { clearMarketHoldings } = await import("./utils/holdings");
+            const { clearMarketHoldings } = await import("../utils/holdings");
             clearMarketHoldings(conditionId);
             logger.info(`\n✅ Cleared holdings record for this market from token-holding.json`);
         } catch (clearError) {

@@ -15,19 +15,16 @@
  *   bun src/auto-redeem.ts --check <conditionId>  # Check if a specific market is resolved
  */
 
-import { resolve } from "path";
-import { config as dotenvConfig } from "dotenv";
-import { 
-    autoRedeemResolvedMarkets, 
-    isMarketResolved, 
-    redeemMarket, 
+import {
+    autoRedeemResolvedMarkets,
+    isMarketResolved,
+    redeemMarket,
     getUserTokenBalances,
-    redeemAllWinningMarketsFromAPI 
-} from "./utils/redeem";
-import { logger } from "./utils/logger";
-import { getAllHoldings } from "./utils/holdings";
-
-dotenvConfig({ path: resolve(process.cwd(), ".env") });
+    redeemAllWinningMarketsFromAPI
+} from "../utils/redeem";
+import { logger } from "../utils/logger";
+import { getAllHoldings } from "../utils/holdings";
+import { env } from "../config/env";
 
 async function main() {
     const args = process.argv.slice(2);
@@ -51,7 +48,7 @@ async function main() {
             
             // Check user's holdings
             try {
-                const privateKey = process.env.PRIVATE_KEY;
+                const privateKey = env.PRIVATE_KEY;
                 if (privateKey) {
                     const { Wallet } = await import("@ethersproject/wallet");
                     const wallet = new Wallet(privateKey);

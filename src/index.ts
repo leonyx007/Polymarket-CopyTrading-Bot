@@ -1,248 +1,131 @@
+#!/usr/bin/env ts-node
+/**
+ * Polymarket Copy Trade (WebSocket)
+ * Receives target wallet trades via WebSocket → processTrade (shared core).
+ * Same copy-trade logic as copytrade-api; only trade source differs.
+ * Usage: npm run start
+ */
+
 import { logger } from "./utils/logger";
 import { createCredential } from "./security/createCredential";
 import { approveUSDCAllowance, updateClobBalanceAllowance } from "./security/allowance";
 import { getRealTimeDataClient } from "./providers/wssProvider";
 import { getClobClient } from "./providers/clobclient";
-import { TradeOrderBuilder } from "./order-builder";
-import type { Message, ConnectionStatus } from "@polymarket/real-time-data-client";
+import type { Message } from "@polymarket/real-time-data-client";
 import { RealTimeDataClient } from "@polymarket/real-time-data-client";
-import { OrderType } from "@polymarket/clob-client";
+import { AssetType } from "@polymarket/clob-client";
 import type { TradePayload } from "./utils/types";
-import { autoRedeemResolvedMarkets } from "./utils/redeem";
+import { env } from "./config/env";
+import { displayWalletBalance, getAvailableBalance } from "./utils/balance";
+import {
+    processTrade,
+    refreshCachedAvailableUsdc,
+    loadProcessedTrades,
+    getTargetWallets,
+    getWalletOrderSize,
+} from "./copy-trade/core";
+import type { TradeForProcess } from "./copy-trade/core";
 
 async function main() {
-    logger.info("Starting the bot...");
-    
-    const targetWalletAddress = process.env.TARGET_WALLET;
-    if (!targetWalletAddress) {
-        logger.error("TARGET_WALLET environment variable is not set", new Error("TARGET_WALLET not set"));
+    const enableCopyTrading = env.ENABLE_COPY_TRADING;
+    const targetCount = getTargetWallets().length;
+    const WALLET_ORDER_SIZE = getWalletOrderSize();
+
+    if (enableCopyTrading && targetCount === 0) {
+        logger.error("No target wallets in src/config/config.json");
         process.exit(1);
     }
 
-    // Configuration for copying trades
-    const sizeMultiplier = parseFloat(process.env.SIZE_MULTIPLIER || "1.0");
-    const maxAmount = process.env.MAX_ORDER_AMOUNT ? parseFloat(process.env.MAX_ORDER_AMOUNT) : undefined;
-    const orderTypeStr = process.env.ORDER_TYPE?.toUpperCase();
-    const orderType = orderTypeStr === "FOK" ? OrderType.FOK : OrderType.FAK;
-    const tickSize = (process.env.TICK_SIZE as "0.1" | "0.01" | "0.001" | "0.0001") || "0.01";
-    const negRisk = process.env.NEG_RISK === "true";
-    const enableCopyTrading = process.env.ENABLE_COPY_TRADING !== "false"; // Default to true
-    
-    // Auto-redemption configuration
-    const redeemDurationMinutes = process.env.REDEEM_DURATION ? parseInt(process.env.REDEEM_DURATION, 10) : null;
-    let isCopyTradingPaused = false; // Flag to pause/resume copy trading during redemption
+    const dryRun = env.DRY_RUN;
+    logger.info(dryRun ? "Starting WebSocket copy-trade bot (DRY RUN – no orders placed)..." : "Starting WebSocket copy-trade bot (LIVE – orders enabled)...");
+    if (dryRun) logger.warn("⚠️  DRY_RUN=true: Only logging. Set DRY_RUN=false in .env to place real orders.");
+    logger.info(
+        `  Order: ${env.ORDER_SIZE_IN_TOKENS ? "token amount" : "fixed USDC (config.json)"} | ` +
+            `Wallets: ${targetCount} | Telegram: ${env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID ? "on" : "off"}`
+    );
 
-    logger.info(`Configuration:`);
-    logger.info(`  Target Wallet: ${targetWalletAddress}`);
-    logger.info(`  Size Multiplier: ${sizeMultiplier}x`);
-    logger.info(`  Max Order Amount: ${maxAmount || "unlimited"}`);
-    logger.info(`  Order Type: ${orderType}`);
-    logger.info(`  Tick Size: ${tickSize}`);
-    logger.info(`  Neg Risk: ${negRisk}`);
-    logger.info(`  Copy Trading: ${enableCopyTrading ? "enabled" : "disabled"}`);
-    
-    // Create credentials if they don't exist
-    const credential = await createCredential();
-    if (credential) {
-        logger.info("Credentials ready");
-    }
+    loadProcessedTrades();
+    await createCredential();
 
-    
-    // Initialize ClobClient first (needed for allowance updates)
-    let clobClient = null;
+    let clobClient: Awaited<ReturnType<typeof getClobClient>> | null = null;
     if (enableCopyTrading) {
-        try {
-            clobClient = await getClobClient();
-        } catch (error) {
-            logger.error("Failed to initialize ClobClient", error);
-            logger.warn("Continuing without ClobClient - orders may fail");
+        clobClient = await getClobClient();
+        await displayWalletBalance(clobClient);
+        await approveUSDCAllowance();
+        await updateClobBalanceAllowance(clobClient);
+        if (env.ORDER_SIZE_IN_TOKENS) {
+            await refreshCachedAvailableUsdc(clobClient);
+            setInterval(async () => {
+                try {
+                    if (clobClient) await refreshCachedAvailableUsdc(clobClient);
+                } catch (_) {}
+            }, 150 * 1000);
         }
     }
 
-    // Approve USDC allowances to Polymarket contracts
-    if (enableCopyTrading && clobClient) {
-        try {
-            logger.info("Approving USDC allowances to Polymarket contracts...");
-            await approveUSDCAllowance();
-            
-            // Update CLOB API to sync with on-chain allowances
-            logger.info("Syncing allowances with CLOB API...");
-            await updateClobBalanceAllowance(clobClient);
-            
-            // Display wallet balance after setup
-            const { displayWalletBalance } = await import("./utils/balance");
-            await displayWalletBalance(clobClient);
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            logger.error(msg);
-            logger.warn("Continuing without allowances - orders may fail");
-        }
-    }
-
-    // Initialize order builder if copy trading is enabled
-    let orderBuilder: TradeOrderBuilder | null = null;
-    if (enableCopyTrading && clobClient) {
-        try {
-            orderBuilder = new TradeOrderBuilder(clobClient);
-            logger.success("Order builder initialized");
-        } catch (error) {
-            logger.error("Failed to initialize order builder", error);
-            logger.warn("Continuing without order execution - trades will only be logged");
-        }
-    }
-
-    const processedTxHashes = new Set<string>();
-
-    const onMessage = async (_client: RealTimeDataClient, message: Message): Promise<void> => {
+    const onMessage = async (_c: RealTimeDataClient, message: Message): Promise<void> => {
+        // Log ALL WebSocket data to verify connection
+        
+        if (message.topic !== "activity" || message.type !== "trades") return;
         const payload = message.payload as TradePayload;
         
-        if (message.topic !== "activity" || message.type !== "trades") {
-            return;
-        }
+        const wallet = payload.proxyWallet?.toLowerCase();
+        
+        if (!wallet || !(wallet in WALLET_ORDER_SIZE) || WALLET_ORDER_SIZE[wallet] <= 0) return;
+        logger.info(`[WS] topic=${message.topic} type=${message.type} payload=${JSON.stringify(message.payload)}`);
 
-        if (payload.proxyWallet?.toLowerCase() === targetWalletAddress.toLowerCase()) {
-            const txKey = `${payload.transactionHash}-${payload.asset}-${payload.side}`;
-            if (processedTxHashes.has(txKey)) {
-                logger.debug(`Skipping duplicate trade: ${txKey}`);
-                return;
-            }
-            processedTxHashes.add(txKey);
-            if (processedTxHashes.size > 1000) {
-                const entries = [...processedTxHashes];
-                entries.splice(0, 500).forEach(k => processedTxHashes.delete(k));
-            }
-            logger.warn(
-                `🎯 Trade detected! ` +
-                `Side: ${payload.side}, ` +
-                `Price: ${payload.price}, ` +
-                `Size: ${payload.size}, ` +
-                `Market: ${payload.title || payload.slug}`
-            );
-            logger.info(
-                `   Transaction: ${payload.transactionHash}, ` +
-                `Outcome: ${payload.outcome}, ` +
-                `Timestamp: ${new Date(payload.timestamp * 1000).toISOString()}`
-            );
+        const tReceived = Date.now();
+        logger.info(`📥 Trade received | ${payload.side} ${payload.title || payload.slug} | $${payload.price} | wallet: ${wallet.substring(0, 10)}...`);
 
-            // Copy the trade if order builder is available and copy trading is not paused
-            if (orderBuilder && enableCopyTrading && !isCopyTradingPaused) {
-                try {
-                    logger.info(`Copying trade with ${sizeMultiplier}x multiplier...`);
-                    const result = await orderBuilder.copyTrade({
-                        trade: payload,
-                        sizeMultiplier,
-                        maxAmount,
-                        orderType,
-                        tickSize,
-                        negRisk,
-                    });
+        const trade: TradeForProcess = {
+            asset: payload.asset,
+            conditionId: payload.conditionId,
+            eventSlug: payload.eventSlug,
+            outcome: payload.outcome,
+            outcomeIndex: payload.outcomeIndex ?? 0,
+            price: payload.price ?? 0,
+            proxyWallet: payload.proxyWallet,
+            side: payload.side,
+            size: payload.size,
+            slug: payload.slug,
+            timestamp: payload.timestamp,
+            title: payload.title,
+            transactionHash: payload.transactionHash,
+            sourceWallet: payload.proxyWallet,
+        };
 
-                    if (result.success) {
-                        logger.success(
-                            `✅ Trade copied successfully! ` +
-                            `OrderID: ${result.orderID || "N/A"}`
-                        );
-                        if (result.transactionHashes && result.transactionHashes.length > 0) {
-                            logger.info(`   Transactions: ${result.transactionHashes.join(", ")}`);
-                        }
-                    } else {
-                        logger.error(`❌ Failed to copy trade: ${result.error}`);
-                    }
-                } catch (error) {
-                    logger.error("Error copying trade", error);
-                }
-            } else if (enableCopyTrading && isCopyTradingPaused) {
-                logger.info("⏸️  Copy trading is paused during redemption - trade not copied");
-            } else if (enableCopyTrading) {
-                logger.warn("Order builder not available - trade not copied");
+        try {
+            const configAmount = WALLET_ORDER_SIZE[wallet];
+            const amountUsdc = env.ORDER_SIZE_IN_TOKENS
+                ? Math.max(1, configAmount * (payload.price ?? 0))
+                : Math.max(1, configAmount);
+            if (env.DRY_RUN) {
+                logger.info(
+                    `   [DRY RUN] Would place ${payload.side} | ` +
+                        `Market: ${payload.title || payload.slug} | ` +
+                        `Outcome: ${payload.outcome} | ` +
+                        `$${payload.price} × size ${payload.size} | ` +
+                        `Config: ${configAmount} → ~$${amountUsdc.toFixed(2)} USDC`
+                );
+                logger.info(`   [DRY RUN] asset=${payload.asset?.substring(0, 20)}... tx=${payload.transactionHash?.substring(0, 16)}...`);
+            } else {
+                await processTrade(trade);
             }
+        } catch (err) {
+            logger.error("Copy trade error", err);
         }
     };
 
     const onConnect = (client: RealTimeDataClient): void => {
-        logger.success("Connected to the server");
-        client.subscribe({
-            subscriptions: [
-                {
-                    topic: "activity",
-                    type: "trades"
-                },
-            ],
-        });
-        logger.info("Subscribed to activity:trades");
+        logger.success("WebSocket connected");
+        client.subscribe({ subscriptions: [{ topic: "activity", type: "trades" }] });
     };
 
-    // Create and connect client with callbacks
-    const client = getRealTimeDataClient({
-        onMessage,
-        onConnect,
-    });
-
-    client.connect();
-    logger.success("Bot started successfully");
-    
-    // Set up automatic redemption timer if enabled
-    if (redeemDurationMinutes && redeemDurationMinutes > 0) {
-        const redeemIntervalMs = redeemDurationMinutes * 60 * 1000; // Convert minutes to milliseconds
-        
-        logger.info(`\n⏰ Auto-redemption scheduled: Every ${redeemDurationMinutes} minutes`);
-        logger.info(`   First redemption will occur in ${redeemDurationMinutes} minutes`);
-        
-        // Function to perform redemption
-        const performRedemption = async () => {
-            try {
-                logger.info("\n" + "=".repeat(60));
-                logger.info("🔄 STARTING AUTOMATIC REDEMPTION");
-                logger.info("=".repeat(60));
-                
-                // Pause copy trading
-                isCopyTradingPaused = true;
-                logger.info("⏸️  Copy trading PAUSED");
-                
-                // Perform redemption using token-holding.json
-                logger.info("📋 Running redemption from token-holding.json...");
-                const redemptionResult = await autoRedeemResolvedMarkets({
-                    maxRetries: 3,
-                });
-                
-                logger.info("\n📊 Redemption Summary:");
-                logger.info(`   Total markets checked: ${redemptionResult.total}`);
-                logger.info(`   Resolved markets: ${redemptionResult.resolved}`);
-                logger.info(`   Successfully redeemed: ${redemptionResult.redeemed}`);
-                logger.info(`   Failed: ${redemptionResult.failed}`);
-                
-                if (redemptionResult.redeemed > 0) {
-                    logger.success(`✅ Successfully redeemed ${redemptionResult.redeemed} market(s)!`);
-                }
-                
-                if (redemptionResult.failed > 0) {
-                    logger.warn(`⚠️  ${redemptionResult.failed} market(s) failed to redeem`);
-                }
-                
-                logger.info("=".repeat(60));
-                
-            } catch (error) {
-                logger.error("Error during automatic redemption", error);
-            } finally {
-                // Resume copy trading
-                isCopyTradingPaused = false;
-                logger.info("▶️  Copy trading RESUMED");
-                logger.info("=".repeat(60) + "\n");
-            }
-        };
-        
-        // Run redemption immediately on first start (optional - you can remove this if you want to wait)
-        // Uncomment the next line if you want redemption to run immediately on bot start
-        // performRedemption();
-        
-        // Set up interval to run redemption every REDEEM_DURATION minutes
-        setInterval(performRedemption, redeemIntervalMs);
-        
-        logger.info(`   Next redemption scheduled in ${redeemDurationMinutes} minutes`);
-    }
+    getRealTimeDataClient({ onMessage, onConnect }).connect();
+    logger.success("Bot running (WebSocket)\n");
 }
 
-main().catch((error) => {
-    logger.error("Fatal error", error);
+main().catch((e) => {
+    logger.error("Fatal", e);
     process.exit(1);
 });
